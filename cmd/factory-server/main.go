@@ -154,6 +154,16 @@ func run() (returnErr error) {
 		cancelSchedules()
 		<-schedulesDone
 	}()
+	labelContext, cancelLabels := context.WithCancel(rootContext)
+	labelsDone := make(chan struct{})
+	go func() {
+		defer close(labelsDone)
+		store.RunLabelPoller(labelContext, logger)
+	}()
+	defer func() {
+		cancelLabels()
+		<-labelsDone
+	}()
 
 	listener, err := net.ListenTCP("tcp", listenAddress)
 	if err != nil {
