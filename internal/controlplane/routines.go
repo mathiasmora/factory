@@ -577,11 +577,16 @@ func (s *Store) admitRoutine(
 		if archived != 0 || migrationOnly != 0 {
 			return protocol.WorkDetail{}, false, conflict("routine_archived", "archived Routines cannot start Work")
 		}
-		if scheduleEnabled == 0 {
-			return protocol.WorkDetail{}, false, conflict("routine_schedule_disabled", "disabled Routine schedules cannot start Work")
-		}
-		if scheduledAt == nil || !pendingDue.Valid || pendingDue.Int64 != scheduledAt.UTC().UnixMilli() {
-			return protocol.WorkDetail{}, false, conflict("routine_occurrence_changed", "the scheduled Routine occurrence changed")
+		// Schedule invariants apply to scheduled admission only. A frozen
+		// snapshot without a due instant comes from a non-schedule trigger
+		// that froze the Routine itself, so there is no occurrence to match.
+		if scheduledAt != nil {
+			if scheduleEnabled == 0 {
+				return protocol.WorkDetail{}, false, conflict("routine_schedule_disabled", "disabled Routine schedules cannot start Work")
+			}
+			if !pendingDue.Valid || pendingDue.Int64 != scheduledAt.UTC().UnixMilli() {
+				return protocol.WorkDetail{}, false, conflict("routine_occurrence_changed", "the scheduled Routine occurrence changed")
+			}
 		}
 	} else {
 		var archived, migrationOnly, readOnly int
