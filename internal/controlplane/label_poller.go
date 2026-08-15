@@ -21,7 +21,7 @@ import (
 
 // The label poller restores label-driven admission on top of the Routines
 // model. It deliberately adds no schema, no protocol field, and no HTTP route:
-// it reuses admitRoutine, whose request_key column is UNIQUE, so an issue that
+// it reuses admitRoutine, whose request_key column is UNIQUE, so an item that
 // was already admitted is skipped by the database rather than by bookkeeping
 // this file would otherwise have to own.
 //
@@ -33,20 +33,60 @@ import (
 //	[[trigger]]
 //	routine = "ClubHub: OpenCode P1 – Implementieren"
 //	label   = "factory:dispatch-oc-p1"
-//	state   = "open"
+//
+//	[[trigger]]
+//	routine      = "ClubHub: Epic-Kette Fortschaltung"
+//	kind         = "pull_request"
+//	label        = "factory:epic-chain"
+//	state        = "merged"
+//	merged_after = "2026-08-15T00:00:00Z"
 
 const (
 	labelPollDefaultInterval = 60 * time.Second
 	labelPollMinimumInterval = 10 * time.Second
 	labelPollCommandTimeout  = 30 * time.Second
-	labelPollMaxIssues       = 100
+	labelPollMaxItems        = 100
 	labelPollMaxOutputBytes  = 4 << 20
+
+	labelKindIssue       = "issue"
+	labelKindPullRequest = "pull_request"
 )
 
 type labelTriggerConfig struct {
 	Routine string `toml:"routine"`
+	Kind    string `toml:"kind"`
 	Label   string `toml:"label"`
 	State   string `toml:"state"`
+	// MergedAfter bounds a merged pull-request trigger. Without it the first
+	// cycle would admit Work for every pull request ever merged with the
+	// label; request_key prevents repeats but not that initial backfill.
+	MergedAfter string `toml:"merged_after"`
+}
+
+func (t labelTriggerConfig) kind() string {
+	if strings.TrimSpace(t.Kind) == "" {
+		return labelKindIssue
+	}
+	return strings.ToLower(strings.TrimSpace(t.Kind))
+}
+
+func (t labelTriggerConfig) state() string {
+	if strings.TrimSpace(t.State) == "" {
+		return "open"
+	}
+	return strings.ToLower(strings.TrimSpace(t.State))
+}
+
+func (t labelTriggerConfig) mergedAfter() (time.Time, error) {
+	value := strings.TrimSpace(t.MergedAfter)
+	if value == "" {
+		return time.Time{}, nil
+	}
+	parsed, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("merged_after must be an RFC3339 instant: %w", err)
+	}
+	return parsed.UTC(), nil
 }
 
 type labelPollerConfig struct {
@@ -77,6 +117,42 @@ func labelPollerConfigPath() string {
 	return filepath.Join(home, "labels.toml")
 }
 
+func validateLabelTrigger(index int, trigger labelTriggerConfig) error {
+	position := index + 1
+	if strings.TrimSpace(trigger.Routine) == "" {
+		return fmt.Errorf("trigger %d: routine is required", position)
+	}
+	if strings.TrimSpace(trigger.Label) == "" {
+		return fmt.Errorf("trigger %d: label is required", position)
+	}
+	switch trigger.kind() {
+	case labelKindIssue:
+		if state := trigger.state(); state != "open" && state != "closed" {
+			return fmt.Errorf("trigger %d: issue state must be open or closed", position)
+		}
+		if strings.TrimSpace(trigger.MergedAfter) != "" {
+			return fmt.Errorf("trigger %d: merged_after applies to pull_request triggers only", position)
+		}
+	case labelKindPullRequest:
+		state := trigger.state()
+		if state != "open" && state != "closed" && state != "merged" {
+			return fmt.Errorf("trigger %d: pull request state must be open, closed, or merged", position)
+		}
+		// Refuse rather than silently replaying years of merged pull requests.
+		if state == "merged" && strings.TrimSpace(trigger.MergedAfter) == "" {
+			return fmt.Errorf(
+				"trigger %d: merged pull-request triggers require merged_after so existing history is not replayed",
+				position)
+		}
+		if _, err := trigger.mergedAfter(); err != nil {
+			return fmt.Errorf("trigger %d: %w", position, err)
+		}
+	default:
+		return fmt.Errorf("trigger %d: kind must be issue or pull_request", position)
+	}
+	return nil
+}
+
 // loadLabelPollerConfig reports found=false when no configuration exists, which
 // is the normal state for an installation that does not use label triggers.
 func loadLabelPollerConfig(path string) (labelPollerConfig, bool, error) {
@@ -95,23 +171,17 @@ func loadLabelPollerConfig(path string) (labelPollerConfig, bool, error) {
 		return config, false, fmt.Errorf("parse %s: %w", path, err)
 	}
 	for index, trigger := range config.Triggers {
-		if strings.TrimSpace(trigger.Routine) == "" {
-			return config, false, fmt.Errorf("trigger %d: routine is required", index+1)
-		}
-		if strings.TrimSpace(trigger.Label) == "" {
-			return config, false, fmt.Errorf("trigger %d: label is required", index+1)
-		}
-		state := strings.ToLower(strings.TrimSpace(trigger.State))
-		if state != "" && state != "open" && state != "closed" {
-			return config, false, fmt.Errorf("trigger %d: state must be open or closed", index+1)
+		if err := validateLabelTrigger(index, trigger); err != nil {
+			return config, false, err
 		}
 	}
 	return config, true, nil
 }
 
-// RunLabelPoller admits Work for issues carrying a configured label. It mirrors
-// RunRoutineScheduler: it never returns an error, because a poller that stops
-// on a transient GitHub failure would silently disable every trigger.
+// RunLabelPoller admits Work for issues and pull requests carrying a configured
+// label. It mirrors RunRoutineScheduler: it never returns an error, because a
+// poller that stops on a transient GitHub failure would silently disable every
+// trigger.
 func (s *Store) RunLabelPoller(ctx context.Context, logger *slog.Logger) {
 	if logger == nil {
 		logger = slog.Default()
@@ -154,7 +224,8 @@ func (s *Store) admitLabelTriggers(ctx context.Context, logger *slog.Logger, con
 				return
 			}
 			logger.Error("label_trigger_failed",
-				"routine", trigger.Routine, "label", trigger.Label, "error", err)
+				"routine", trigger.Routine, "kind", trigger.kind(),
+				"label", trigger.Label, "error", err)
 		}
 	}
 }
@@ -167,31 +238,32 @@ func (s *Store) admitLabelTrigger(ctx context.Context, logger *slog.Logger, trig
 	if len(snapshot.Repositories) == 0 {
 		return fmt.Errorf("routine %q has no repositories", trigger.Routine)
 	}
-	state := strings.ToLower(strings.TrimSpace(trigger.State))
-	if state == "" {
-		state = "open"
+	mergedAfter, err := trigger.mergedAfter()
+	if err != nil {
+		return err
 	}
 	for _, repository := range snapshot.Repositories {
-		issues, err := listLabelledIssues(ctx, repository.RemoteIdentity, trigger.Label, state)
+		items, err := listLabelledItems(ctx, trigger.kind(), repository.RemoteIdentity,
+			trigger.Label, trigger.state(), mergedAfter)
 		if err != nil {
 			return err
 		}
-		for _, issue := range issues {
+		for _, item := range items {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			admitted, err := s.admitLabelledIssue(ctx, routineID, snapshot, trigger.Label, repository, issue)
+			admitted, err := s.admitLabelledItem(ctx, routineID, snapshot, trigger.Label, repository, item)
 			if err != nil {
 				logger.Error("label_admission_failed",
-					"routine", trigger.Routine, "label", trigger.Label,
-					"repository", repository.RemoteIdentity, "issue", issue.Number,
+					"routine", trigger.Routine, "kind", item.Kind, "label", trigger.Label,
+					"repository", repository.RemoteIdentity, "number", item.Number,
 					"error", err)
 				continue
 			}
 			if admitted {
 				logger.Info("label_work_admitted",
-					"routine", trigger.Routine, "label", trigger.Label,
-					"repository", repository.RemoteIdentity, "issue", issue.Number)
+					"routine", trigger.Routine, "kind", item.Kind, "label", trigger.Label,
+					"repository", repository.RemoteIdentity, "number", item.Number)
 			}
 		}
 	}
@@ -260,22 +332,24 @@ func (s *Store) labelTriggerRoutine(ctx context.Context, name string) (string, p
 	return id, snapshot, nil
 }
 
-// admitLabelledIssue reports whether new Work was created. A repeated call for
-// an issue that was already admitted returns false without error, because the
+// admitLabelledItem reports whether new Work was created. A repeated call for
+// an item that was already admitted returns false without error, because the
 // UNIQUE request_key makes admitRoutine idempotent.
-func (s *Store) admitLabelledIssue(
+func (s *Store) admitLabelledItem(
 	ctx context.Context,
 	routineID string,
 	snapshot protocol.RoutineSnapshot,
 	label string,
 	repository protocol.RoutineRepository,
-	issue labelledIssue,
+	item labelledItem,
 ) (bool, error) {
 	frozen := snapshot
-	frozen.Prompt = resolveLabelPrompt(snapshot.Prompt, label, repository.RemoteIdentity, issue)
-	requestKey := fmt.Sprintf("label:%s:%s:issue:%d", routineID, label, issue.Number)
+	frozen.Prompt = resolveLabelPrompt(snapshot.Prompt, label, repository.RemoteIdentity, item)
+	// Issues and pull requests share a number space per repository, so the kind
+	// belongs in the key.
+	requestKey := fmt.Sprintf("label:%s:%s:%s:%d", routineID, label, item.Kind, item.Number)
 	if len(requestKey) > 200 {
-		return false, fmt.Errorf("request key for issue #%d exceeds 200 bytes", issue.Number)
+		return false, fmt.Errorf("request key for %s #%d exceeds 200 bytes", item.Kind, item.Number)
 	}
 	_, created, err := s.admitRoutine(ctx, routineID, "manual", requestKey, nil, &frozen)
 	if err != nil {
@@ -287,9 +361,10 @@ func (s *Store) admitLabelledIssue(
 // resolveLabelPrompt mirrors protocol.ResolveRoutineSchedulePrompt: the trusted
 // occurrence is appended as JSON so the agent can tell operator prompt text
 // apart from Factory-supplied context.
-func resolveLabelPrompt(prompt, label, repository string, issue labelledIssue) string {
+func resolveLabelPrompt(prompt, label, repository string, item labelledItem) string {
 	occurrence, err := json.Marshal(struct {
 		Type       string   `json:"type"`
+		Kind       string   `json:"kind"`
 		Label      string   `json:"label"`
 		Repository string   `json:"repository"`
 		Number     int      `json:"number"`
@@ -297,33 +372,131 @@ func resolveLabelPrompt(prompt, label, repository string, issue labelledIssue) s
 		URL        string   `json:"url"`
 		State      string   `json:"state"`
 		Labels     []string `json:"labels"`
-	}{"label", label, repository, issue.Number, issue.Title, issue.URL, issue.State, issue.Labels})
+		BaseBranch string   `json:"base_branch,omitempty"`
+		MergedAt   string   `json:"merged_at,omitempty"`
+	}{"label", item.Kind, label, repository, item.Number, item.Title, item.URL,
+		item.State, item.Labels, item.BaseBranch, item.MergedAt})
 	if err != nil {
 		// Marshalling these fields cannot fail; degrade to the bare prompt
 		// rather than dropping the occurrence.
 		return prompt
 	}
+	subject := "GitHub issue"
+	if item.Kind == labelKindPullRequest {
+		subject = "GitHub pull request"
+	}
 	return prompt +
 		"\n\nLabel instruction:\n\n" +
-		"Execute this Routine for the GitHub issue below. Revalidate the issue before acting on it." +
+		"Execute this Routine for the " + subject + " below. Revalidate it before acting on it." +
 		"\n\nTrusted label occurrence:\n\n" + string(occurrence)
 }
 
-type labelledIssue struct {
-	Number int      `json:"number"`
-	Title  string   `json:"title"`
-	URL    string   `json:"url"`
-	State  string   `json:"state"`
-	Labels []string `json:"-"`
+type labelledItem struct {
+	Kind       string
+	Number     int
+	Title      string
+	URL        string
+	State      string
+	Labels     []string
+	BaseBranch string
+	MergedAt   string
 }
 
-func listLabelledIssues(ctx context.Context, repository, label, state string) ([]labelledIssue, error) {
+func listLabelledItems(
+	ctx context.Context,
+	kind, repository, label, state string,
+	mergedAfter time.Time,
+) ([]labelledItem, error) {
 	project := strings.TrimPrefix(repository, "github.com/")
-	arguments := []string{
-		"issue", "list", "--repo", project, "--state", state,
-		"--label", label, "--limit", strconv.Itoa(labelPollMaxIssues),
-		"--json", "number,title,url,labels,state",
+	var arguments []string
+	switch kind {
+	case labelKindPullRequest:
+		arguments = []string{
+			"pr", "list", "--repo", project, "--state", state,
+			"--label", label, "--limit", strconv.Itoa(labelPollMaxItems),
+			"--json", "number,title,url,state,labels,baseRefName,mergedAt",
+		}
+	default:
+		arguments = []string{
+			"issue", "list", "--repo", project, "--state", state,
+			"--label", label, "--limit", strconv.Itoa(labelPollMaxItems),
+			"--json", "number,title,url,state,labels",
+		}
 	}
+	stdout, err := runLabelPollCommand(ctx, project, arguments)
+	if err != nil {
+		return nil, err
+	}
+	var values []struct {
+		Number      int    `json:"number"`
+		Title       string `json:"title"`
+		URL         string `json:"url"`
+		State       string `json:"state"`
+		BaseRefName string `json:"baseRefName"`
+		MergedAt    string `json:"mergedAt"`
+		Labels      []struct {
+			Name string `json:"name"`
+		} `json:"labels"`
+	}
+	if err := json.Unmarshal(stdout, &values); err != nil {
+		return nil, fmt.Errorf("gh returned unexpected JSON for %s: %w", project, err)
+	}
+	items := make([]labelledItem, 0, len(values))
+	for _, value := range values {
+		if value.Number <= 0 {
+			return nil, fmt.Errorf("gh returned an invalid number for %s", project)
+		}
+		if kind == labelKindPullRequest && !mergedAfter.IsZero() {
+			include, err := mergedAfterBound(value.MergedAt, mergedAfter)
+			if err != nil {
+				return nil, fmt.Errorf("gh returned an unreadable mergedAt for %s #%d: %w",
+					project, value.Number, err)
+			}
+			if !include {
+				continue
+			}
+		}
+		labels := make([]string, 0, len(value.Labels))
+		for _, entry := range value.Labels {
+			labels = append(labels, entry.Name)
+		}
+		items = append(items, labelledItem{
+			Kind:       normalizeLabelKind(kind),
+			Number:     value.Number,
+			Title:      strings.TrimSpace(value.Title),
+			URL:        strings.TrimSpace(value.URL),
+			State:      strings.ToLower(strings.TrimSpace(value.State)),
+			Labels:     labels,
+			BaseBranch: strings.TrimSpace(value.BaseRefName),
+			MergedAt:   strings.TrimSpace(value.MergedAt),
+		})
+	}
+	return items, nil
+}
+
+func normalizeLabelKind(kind string) string {
+	if kind == labelKindPullRequest {
+		return labelKindPullRequest
+	}
+	return labelKindIssue
+}
+
+// mergedAfterBound reports whether a pull request merged at the reported
+// instant falls inside the configured bound. An unmerged entry is excluded
+// rather than treated as merged at the zero time.
+func mergedAfterBound(mergedAt string, bound time.Time) (bool, error) {
+	value := strings.TrimSpace(mergedAt)
+	if value == "" {
+		return false, nil
+	}
+	parsed, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return false, err
+	}
+	return !parsed.UTC().Before(bound), nil
+}
+
+func runLabelPollCommand(ctx context.Context, project string, arguments []string) ([]byte, error) {
 	commandContext, cancel := context.WithTimeout(ctx, labelPollCommandTimeout)
 	defer cancel()
 	command := exec.CommandContext(commandContext, "gh", arguments...)
@@ -334,7 +507,7 @@ func listLabelledIssues(ctx context.Context, repository, label, state string) ([
 		case errors.Is(err, exec.ErrNotFound):
 			return nil, errors.New("GitHub CLI (gh) was not found on PATH")
 		case errors.Is(commandContext.Err(), context.DeadlineExceeded):
-			return nil, fmt.Errorf("gh issue list for %s timed out", project)
+			return nil, fmt.Errorf("gh %s for %s timed out", arguments[0], project)
 		case errors.Is(ctx.Err(), context.Canceled):
 			return nil, ctx.Err()
 		case errors.As(err, &exitError):
@@ -342,42 +515,13 @@ func listLabelledIssues(ctx context.Context, repository, label, state string) ([
 			if message == "" {
 				message = err.Error()
 			}
-			return nil, fmt.Errorf("gh issue list for %s failed: %s", project, message)
+			return nil, fmt.Errorf("gh %s for %s failed: %s", arguments[0], project, message)
 		default:
-			return nil, fmt.Errorf("gh issue list for %s failed: %w", project, err)
+			return nil, fmt.Errorf("gh %s for %s failed: %w", arguments[0], project, err)
 		}
 	}
 	if len(stdout) > labelPollMaxOutputBytes {
 		return nil, fmt.Errorf("gh returned more than %d bytes for %s", labelPollMaxOutputBytes, project)
 	}
-	var values []struct {
-		Number int    `json:"number"`
-		Title  string `json:"title"`
-		URL    string `json:"url"`
-		State  string `json:"state"`
-		Labels []struct {
-			Name string `json:"name"`
-		} `json:"labels"`
-	}
-	if err := json.Unmarshal(stdout, &values); err != nil {
-		return nil, fmt.Errorf("gh returned unexpected JSON for %s: %w", project, err)
-	}
-	issues := make([]labelledIssue, 0, len(values))
-	for _, value := range values {
-		if value.Number <= 0 {
-			return nil, fmt.Errorf("gh returned an invalid issue number for %s", project)
-		}
-		labels := make([]string, 0, len(value.Labels))
-		for _, entry := range value.Labels {
-			labels = append(labels, entry.Name)
-		}
-		issues = append(issues, labelledIssue{
-			Number: value.Number,
-			Title:  strings.TrimSpace(value.Title),
-			URL:    strings.TrimSpace(value.URL),
-			State:  strings.ToLower(strings.TrimSpace(value.State)),
-			Labels: labels,
-		})
-	}
-	return issues, nil
+	return stdout, nil
 }
