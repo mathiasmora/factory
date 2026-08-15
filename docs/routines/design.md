@@ -162,9 +162,32 @@ creates or edits a Routine when they want different behavior.
 #### One optional schedule
 
 A Routine has scheduling off or one cron expression with one IANA timezone.
-We reject multiple triggers in the first model because they would require
+We reject multiple cron cadences in the first model because they would require
 independent health, due cursors, and controls. A second cadence can be a second
 Routine with an explicit name.
+
+#### Activation is a Routine property, not a schedule property
+
+A Routine carries `enabled` separately from `schedule.enabled`. A Routine that
+starts from a label trigger and no cron must still be pausable, so the schedule
+switch cannot stand in for "this Routine may start Work". Pausing stops
+scheduled and triggered admission and leaves Run now available, because an
+operator testing a Routine should not have to expose it to its triggers first.
+Archiving implies pausing.
+
+#### GitHub label triggers own their poll cursor
+
+A Routine may carry up to ten label triggers. Each names an event kind
+(issue or pull request), a label, an item state, and its own poll interval, so
+a slow chain trigger does not force a fast dispatch trigger onto its cadence.
+A merged pull-request trigger requires a `merged_after` bound: without one, its
+first poll would admit Work for every pull request ever merged with the label.
+The poll cursor survives an edit that keeps a trigger's kind and label, so
+renaming a Routine does not re-poll GitHub.
+
+Admission reuses `admitRoutine`, whose `request_key` is UNIQUE, so a repeated
+poll over an unchanged item is skipped by the database rather than by
+bookkeeping the poller would otherwise own.
 
 #### No parameter schema in the first model
 
@@ -205,6 +228,10 @@ stated goal is to avoid naming debt.
 - `INV-8`: Retrying one Target does not replay successful sibling Targets.
 - `INV-9`: Disabling a schedule stops future admission but does not cancel
   active Work.
+- `INV-15`: A paused or archived Routine admits no scheduled and no triggered
+  Work, and pausing does not cancel active Work.
+- `INV-16`: One Routine, label, event kind, and item number admit at most one
+  Work, however often the trigger polls.
 - `INV-10`: Workers receive only the resolved Work Target snapshot, never
   mutable Routine state.
 - `INV-11`: The database, API, UI, logs, and metrics use Routine, Work, Target,
@@ -647,7 +674,7 @@ and platform jobs prove `AC-12`.
 
 ## 13. Out of scope
 
-- GitHub issue, pull-request, or webhook triggers.
+- GitHub webhook triggers. Label triggers poll through the GitHub CLI.
 - Multiple schedules or generic trigger plugins.
 - Per-invocation prompt text, repository overrides, or typed parameters.
 - Workflow graphs, dependencies, approvals, or chained Routines.

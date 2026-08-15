@@ -68,6 +68,9 @@ export const api = {
   archiveRoutine: (id: string, archived: boolean, expectedGeneration: number) => request<Routine>(`/api/v1/routines/${encodeURIComponent(id)}/archived`, {
     method: "PUT", body: JSON.stringify({ archived, expected_generation: expectedGeneration }),
   }),
+  setRoutineEnabled: (id: string, enabled: boolean, expectedGeneration: number) => request<Routine>(`/api/v1/routines/${encodeURIComponent(id)}/enabled`, {
+    method: "PUT", body: JSON.stringify({ enabled, expected_generation: expectedGeneration }),
+  }),
   runRoutine: (id: string, requestKey: string) => request<WorkDetailV2>(`/api/v1/routines/${encodeURIComponent(id)}/run`, {
     method: "POST", body: JSON.stringify({ request_key: requestKey }),
   }),

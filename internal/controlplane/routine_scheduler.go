@@ -73,7 +73,7 @@ func (s *Store) claimDueRoutine(ctx context.Context) (string, time.Time, protoco
 	err = tx.QueryRowContext(ctx, `
 		SELECT id, pending_due_at, next_due_at, pending_snapshot_json
 		FROM routines
-		WHERE migration_only = 0 AND archived = 0 AND schedule_enabled = 1
+		WHERE migration_only = 0 AND archived = 0 AND enabled = 1 AND schedule_enabled = 1
 		  AND (
 		      (pending_due_at IS NOT NULL AND schedule_retry_at IS NOT NULL AND schedule_retry_at <= ?)
 		      OR (pending_due_at IS NULL AND next_due_at IS NOT NULL AND next_due_at <= ?)
@@ -194,18 +194,18 @@ func (s *Store) finishRoutineOccurrence(ctx context.Context, id string, due time
 	}
 	defer tx.Rollback()
 	var cron, timezone string
-	var retryCount, enabled, archived int
+	var retryCount, enabled, archived, routineEnabled int
 	err = tx.QueryRowContext(ctx, `
-		SELECT cron, timezone, schedule_retry_count, schedule_enabled, archived FROM routines
+		SELECT cron, timezone, schedule_retry_count, schedule_enabled, archived, enabled FROM routines
 		WHERE id = ? AND pending_due_at = ?
-	`, id, due.UnixMilli()).Scan(&cron, &timezone, &retryCount, &enabled, &archived)
+	`, id, due.UnixMilli()).Scan(&cron, &timezone, &retryCount, &enabled, &archived, &routineEnabled)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
 	if err != nil {
 		return unavailable(err)
 	}
-	if !admitted && (enabled == 0 || archived != 0) {
+	if !admitted && (enabled == 0 || archived != 0 || routineEnabled == 0) {
 		if err := tx.Commit(); err != nil {
 			return unavailable(err)
 		}

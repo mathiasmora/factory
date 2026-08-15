@@ -65,10 +65,12 @@ type normalizedRoutine struct {
 	timeoutSeconds   int
 	concurrencyLimit int
 	repositoryIDs    []string
+	enabled          bool
 	scheduleEnabled  bool
 	cron             string
 	timezone         string
 	nextDueAt        *time.Time
+	triggers         []protocol.RoutineTrigger
 }
 
 func normalizeRoutine(input protocol.SaveRoutineRequest, now time.Time) (normalizedRoutine, error) {
@@ -79,10 +81,16 @@ func normalizeRoutine(input protocol.SaveRoutineRequest, now time.Time) (normali
 		timeoutSeconds:   input.TimeoutSeconds,
 		concurrencyLimit: input.ConcurrencyLimit,
 		repositoryIDs:    append([]string(nil), input.RepositoryIDs...),
+		enabled:          input.Enabled == nil || *input.Enabled,
 		scheduleEnabled:  input.Schedule.Enabled,
 		cron:             strings.TrimSpace(input.Schedule.Cron),
 		timezone:         strings.TrimSpace(input.Schedule.Timezone),
 	}
+	triggers, err := normalizeRoutineTriggers(input.Triggers)
+	if err != nil {
+		return value, err
+	}
+	value.triggers = triggers
 	value.nameKey = normalizeTitleKey(value.name)
 	if value.name == "" || utf8.RuneCountInString(value.name) > 200 {
 		return value, invalid("invalid_routine_name", "name is required and limited to 200 characters")
@@ -110,6 +118,10 @@ func normalizeRoutine(input protocol.SaveRoutineRequest, now time.Time) (normali
 	}
 	if len(value.repositoryIDs) == 0 && value.scheduleEnabled {
 		return value, invalid("routine_repository_required", "select at least one repository before enabling a schedule")
+	}
+	// A trigger polls the Routine's repositories, so it cannot run without one.
+	if len(value.repositoryIDs) == 0 && len(value.triggers) > 0 {
+		return value, invalid("routine_repository_required", "select at least one repository before adding a trigger")
 	}
 	if len(value.repositoryIDs) > protocol.MaxRoutineRepositories {
 		return value, invalid("too_many_routine_repositories", "a Routine is limited to 100 repositories")
@@ -183,11 +195,11 @@ func (s *Store) CreateRoutine(ctx context.Context, input protocol.SaveRoutineReq
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO routines(
 			id, name, name_key, prompt, runtime, timeout_seconds,
-			concurrency_limit, generation, archived, migration_only, schedule_enabled,
+			concurrency_limit, generation, enabled, archived, migration_only, schedule_enabled,
 			cron, timezone, next_due_at, schedule_health_status, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0, 0, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?)
 	`, id, value.name, value.nameKey, value.prompt, value.runtime, value.timeoutSeconds,
-		value.concurrencyLimit, value.scheduleEnabled, nullableString(value.cron), nullableString(value.timezone),
+		value.concurrencyLimit, value.enabled, value.scheduleEnabled, nullableString(value.cron), nullableString(value.timezone),
 		next, routineScheduleHealth(value.scheduleEnabled), now, now)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
@@ -196,6 +208,9 @@ func (s *Store) CreateRoutine(ctx context.Context, input protocol.SaveRoutineReq
 		return protocol.Routine{}, unavailable(err)
 	}
 	if err := replaceRoutineRepositories(ctx, tx, id, value.repositoryIDs); err != nil {
+		return protocol.Routine{}, err
+	}
+	if err := replaceRoutineTriggers(ctx, tx, id, value.triggers); err != nil {
 		return protocol.Routine{}, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -244,6 +259,10 @@ func (s *Store) UpdateRoutine(ctx context.Context, id string, input protocol.Sav
 	if archived != 0 && value.scheduleEnabled {
 		return protocol.Routine{}, conflict("routine_archived", "an archived Routine cannot be scheduled")
 	}
+	if archived != 0 {
+		// An archived Routine starts no Work, so it cannot be active either.
+		value.enabled = false
+	}
 	now := s.now().UnixMilli()
 	var next any
 	if value.scheduleEnabled && value.nextDueAt != nil && !pendingDue.Valid {
@@ -254,7 +273,7 @@ func (s *Store) UpdateRoutine(ctx context.Context, id string, input protocol.Sav
 	result, err := tx.ExecContext(ctx, `
 		UPDATE routines SET
 			name = ?, name_key = ?, prompt = ?, runtime = ?, timeout_seconds = ?,
-			concurrency_limit = ?, generation = generation + 1, schedule_enabled = ?,
+			concurrency_limit = ?, generation = generation + 1, enabled = ?, schedule_enabled = ?,
 			cron = CASE WHEN pending_due_at IS NOT NULL AND ? = 0 THEN cron ELSE ? END,
 			timezone = CASE WHEN pending_due_at IS NOT NULL AND ? = 0 THEN timezone ELSE ? END,
 			next_due_at = CASE WHEN pending_due_at IS NULL THEN ? ELSE next_due_at END,
@@ -270,7 +289,7 @@ func (s *Store) UpdateRoutine(ctx context.Context, id string, input protocol.Sav
 			updated_at = ?
 		WHERE id = ? AND generation = ?
 	`, value.name, value.nameKey, value.prompt, value.runtime, value.timeoutSeconds,
-		value.concurrencyLimit, value.scheduleEnabled, value.scheduleEnabled, nullableString(value.cron),
+		value.concurrencyLimit, value.enabled, value.scheduleEnabled, value.scheduleEnabled, nullableString(value.cron),
 		value.scheduleEnabled, nullableString(value.timezone),
 		next, value.scheduleEnabled, preserveBlockedOccurrence, value.scheduleEnabled,
 		preserveBlockedOccurrence, preserveBlockedOccurrence, now, id, input.ExpectedGeneration)
@@ -284,6 +303,9 @@ func (s *Store) UpdateRoutine(ctx context.Context, id string, input protocol.Sav
 		return protocol.Routine{}, conflict("routine_generation_conflict", "the Routine changed; refresh and try again")
 	}
 	if err := replaceRoutineRepositories(ctx, tx, id, value.repositoryIDs); err != nil {
+		return protocol.Routine{}, err
+	}
+	if err := replaceRoutineTriggers(ctx, tx, id, value.triggers); err != nil {
 		return protocol.Routine{}, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -344,12 +366,13 @@ func (s *Store) SetRoutineArchived(ctx context.Context, id string, input protoco
 	now := s.now().UnixMilli()
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE routines SET archived = ?, generation = generation + 1,
+			enabled = CASE WHEN ? = 1 THEN 0 ELSE enabled END,
 			schedule_enabled = CASE WHEN ? = 1 THEN 0 ELSE schedule_enabled END,
 			next_due_at = CASE WHEN ? = 1 THEN NULL ELSE next_due_at END,
 			schedule_health_status = CASE WHEN ? = 1 THEN 'disabled' ELSE schedule_health_status END,
 			updated_at = ?
 		WHERE id = ? AND generation = ? AND migration_only = 0 AND read_only = 0
-	`, archived, archived, archived, archived, now, id, input.ExpectedGeneration)
+	`, archived, archived, archived, archived, archived, now, id, input.ExpectedGeneration)
 	if err != nil {
 		return protocol.Routine{}, unavailable(err)
 	}
@@ -442,17 +465,17 @@ func routineSummary(routine protocol.Routine) protocol.Routine {
 
 func (s *Store) Routine(ctx context.Context, id string) (protocol.Routine, error) {
 	var routine protocol.Routine
-	var archived, readOnly, scheduleEnabled int
+	var enabled, archived, readOnly, scheduleEnabled int
 	var cron, timezone sql.NullString
 	var nextDue, pendingDue sql.NullInt64
 	var created, updated int64
 	err := s.db.QueryRowContext(ctx, `
 		SELECT id, name, prompt, runtime, timeout_seconds, concurrency_limit,
-		       generation, archived, read_only, schedule_enabled, cron, timezone, next_due_at, pending_due_at,
+		       generation, enabled, archived, read_only, schedule_enabled, cron, timezone, next_due_at, pending_due_at,
 		       schedule_health_status, schedule_health_code, schedule_health_message, created_at, updated_at
 		FROM routines WHERE id = ? AND migration_only = 0
 	`, id).Scan(&routine.ID, &routine.Name, &routine.Prompt, &routine.Runtime,
-		&routine.TimeoutSeconds, &routine.ConcurrencyLimit, &routine.Generation, &archived, &readOnly,
+		&routine.TimeoutSeconds, &routine.ConcurrencyLimit, &routine.Generation, &enabled, &archived, &readOnly,
 		&scheduleEnabled, &cron, &timezone, &nextDue, &pendingDue, &routine.Schedule.HealthStatus,
 		&routine.Schedule.HealthCode, &routine.Schedule.HealthMessage, &created, &updated)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -461,6 +484,7 @@ func (s *Store) Routine(ctx context.Context, id string) (protocol.Routine, error
 	if err != nil {
 		return routine, unavailable(err)
 	}
+	routine.Enabled = enabled != 0
 	routine.Archived = archived != 0
 	routine.ReadOnly = readOnly != 0
 	routine.Schedule.Enabled = scheduleEnabled != 0
@@ -495,6 +519,11 @@ func (s *Store) Routine(ctx context.Context, id string) (protocol.Routine, error
 		return routine, unavailable(err)
 	}
 	routine.RepositoryCount = len(routine.Repositories)
+	triggers, err := loadRoutineTriggers(ctx, s.db, id)
+	if err != nil {
+		return routine, err
+	}
+	routine.Triggers = triggers
 	_ = s.db.QueryRowContext(ctx, `
 		SELECT COALESCE((SELECT CASE
 			WHEN SUM(target.state IN ('blocked','queued','preparing','running')) = 0 THEN CASE

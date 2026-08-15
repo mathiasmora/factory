@@ -19,14 +19,15 @@ import (
 	"github.com/owainlewis/factory/internal/protocol"
 )
 
-// The label poller restores label-driven admission on top of the Routines
-// model. It deliberately adds no schema, no protocol field, and no HTTP route:
-// it reuses admitRoutine, whose request_key column is UNIQUE, so an item that
-// was already admitted is skipped by the database rather than by bookkeeping
-// this file would otherwise have to own.
+// The label poller admits Work for issues and pull requests carrying a label
+// an operator configured on a Routine. It reuses admitRoutine, whose
+// request_key column is UNIQUE, so an item that was already admitted is
+// skipped by the database rather than by bookkeeping this file would
+// otherwise have to own.
 //
-// Configuration lives in $FACTORY_DATA_HOME/labels.toml and is reread every
-// cycle, so triggers can be changed without restarting the server:
+// Triggers live in routine_triggers and are authored in the UI. An existing
+// $FACTORY_DATA_HOME/labels.toml is imported once on first start so operators
+// who configured triggers as a file keep them:
 //
 //	poll_interval_seconds = 60
 //
@@ -40,17 +41,41 @@ import (
 //	label        = "factory:epic-chain"
 //	state        = "merged"
 //	merged_after = "2026-08-15T00:00:00Z"
+//
+// After the import the file is ignored: recreating triggers from it on every
+// start would resurrect triggers the operator has since deleted in the UI.
 
 const (
-	labelPollDefaultInterval = 60 * time.Second
-	labelPollMinimumInterval = 10 * time.Second
-	labelPollCommandTimeout  = 30 * time.Second
-	labelPollMaxItems        = 100
-	labelPollMaxOutputBytes  = 4 << 20
+	// labelPollTick bounds how often due triggers are looked for. A trigger's
+	// own poll_interval_seconds decides when it is next due, so this only
+	// bounds the scheduling granularity.
+	labelPollTick           = 10 * time.Second
+	labelPollCommandTimeout = 30 * time.Second
+	labelPollMaxItems       = 100
+	labelPollMaxOutputBytes = 4 << 20
 
 	labelKindIssue       = "issue"
 	labelKindPullRequest = "pull_request"
 )
+
+// dueLabelTrigger is one trigger row joined to the Routine that owns it.
+type dueLabelTrigger struct {
+	routineID           string
+	position            int
+	kind                string
+	label               string
+	state               string
+	pollIntervalSeconds int
+	mergedAfter         time.Time
+}
+
+// pollKind maps the stored protocol kind onto the gh subcommand selector.
+func (t dueLabelTrigger) pollKind() string {
+	if t.kind == protocol.TriggerGitHubPullRequest {
+		return labelKindPullRequest
+	}
+	return labelKindIssue
+}
 
 type labelTriggerConfig struct {
 	Routine string `toml:"routine"`
@@ -94,15 +119,19 @@ type labelPollerConfig struct {
 	Triggers            []labelTriggerConfig `toml:"trigger"`
 }
 
-func (c labelPollerConfig) interval() time.Duration {
+// intervalSeconds is the file's single interval, applied to every trigger it
+// imports. Each imported trigger owns its interval from then on.
+func (c labelPollerConfig) intervalSeconds() int {
 	if c.PollIntervalSeconds <= 0 {
-		return labelPollDefaultInterval
+		return protocol.DefaultTriggerPollSeconds
 	}
-	interval := time.Duration(c.PollIntervalSeconds) * time.Second
-	if interval < labelPollMinimumInterval {
-		return labelPollMinimumInterval
+	if c.PollIntervalSeconds < protocol.MinTriggerPollInterval {
+		return protocol.MinTriggerPollInterval
 	}
-	return interval
+	if c.PollIntervalSeconds > protocol.MaxTriggerPollInterval {
+		return protocol.MaxTriggerPollInterval
+	}
+	return c.PollIntervalSeconds
 }
 
 func labelPollerConfigPath() string {
@@ -178,73 +207,107 @@ func loadLabelPollerConfig(path string) (labelPollerConfig, bool, error) {
 	return config, true, nil
 }
 
-// RunLabelPoller admits Work for issues and pull requests carrying a configured
-// label. It mirrors RunRoutineScheduler: it never returns an error, because a
-// poller that stops on a transient GitHub failure would silently disable every
-// trigger.
+// RunLabelPoller admits Work for issues and pull requests carrying a
+// configured label. It mirrors RunRoutineScheduler: it never returns an error,
+// because a poller that stops on a transient GitHub failure would silently
+// disable every trigger.
 func (s *Store) RunLabelPoller(ctx context.Context, logger *slog.Logger) {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	path := labelPollerConfigPath()
-	interval := labelPollDefaultInterval
-	var lastConfigError string
+	s.importLabelPollerConfig(ctx, logger)
 	for {
-		config, found, err := loadLabelPollerConfig(path)
-		switch {
-		case err != nil:
-			// Log a given configuration error once rather than every cycle.
-			if message := err.Error(); message != lastConfigError {
-				logger.Error("label_poller_config_invalid", "path", path, "error", message)
-				lastConfigError = message
-			}
-		case found:
-			if lastConfigError != "" {
-				logger.Info("label_poller_config_recovered", "path", path)
-				lastConfigError = ""
-			}
-			interval = config.interval()
-			s.admitLabelTriggers(ctx, logger, config)
-		}
+		s.admitDueLabelTriggers(ctx, logger)
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(interval):
+		case <-time.After(labelPollTick):
 		}
 	}
 }
 
-func (s *Store) admitLabelTriggers(ctx context.Context, logger *slog.Logger, config labelPollerConfig) {
-	for _, trigger := range config.Triggers {
+func (s *Store) admitDueLabelTriggers(ctx context.Context, logger *slog.Logger) {
+	triggers, err := s.dueLabelTriggers(ctx)
+	if err != nil {
+		if !errors.Is(err, context.Canceled) {
+			logger.Error("label_trigger_load_failed", "error", err)
+		}
+		return
+	}
+	for _, trigger := range triggers {
 		if ctx.Err() != nil {
 			return
 		}
-		if err := s.admitLabelTrigger(ctx, logger, trigger); err != nil {
-			if errors.Is(err, context.Canceled) {
-				return
-			}
+		err := s.admitLabelTrigger(ctx, logger, trigger)
+		if errors.Is(err, context.Canceled) {
+			return
+		}
+		// The cursor advances even after a failure. Leaving it untouched would
+		// retry a failing trigger on every tick instead of its own interval.
+		if cursorErr := s.advanceLabelTriggerCursor(ctx, trigger); cursorErr != nil {
+			logger.Error("label_trigger_cursor_failed",
+				"routine_id", trigger.routineID, "label", trigger.label, "error", cursorErr)
+		}
+		if err != nil {
 			logger.Error("label_trigger_failed",
-				"routine", trigger.Routine, "kind", trigger.kind(),
-				"label", trigger.Label, "error", err)
+				"routine_id", trigger.routineID, "kind", trigger.kind,
+				"label", trigger.label, "error", err)
 		}
 	}
 }
 
-func (s *Store) admitLabelTrigger(ctx context.Context, logger *slog.Logger, trigger labelTriggerConfig) error {
-	routineID, snapshot, err := s.labelTriggerRoutine(ctx, trigger.Routine)
+// dueLabelTriggers returns the triggers of active Routines whose next poll
+// instant has passed.
+func (s *Store) dueLabelTriggers(ctx context.Context) ([]dueLabelTrigger, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT trigger.routine_id, trigger.position, trigger.kind, trigger.label,
+		       trigger.item_state, trigger.poll_interval_seconds, trigger.merged_after
+		FROM routine_triggers trigger
+		JOIN routines routine ON routine.id = trigger.routine_id
+		WHERE routine.enabled = 1 AND routine.archived = 0
+		  AND routine.migration_only = 0 AND routine.read_only = 0
+		  AND (trigger.next_poll_at IS NULL OR trigger.next_poll_at <= ?)
+		ORDER BY COALESCE(trigger.next_poll_at, 0), trigger.routine_id, trigger.position
+	`, s.now().UnixMilli())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var triggers []dueLabelTrigger
+	for rows.Next() {
+		var trigger dueLabelTrigger
+		var mergedAfter sql.NullInt64
+		if err := rows.Scan(&trigger.routineID, &trigger.position, &trigger.kind,
+			&trigger.label, &trigger.state, &trigger.pollIntervalSeconds, &mergedAfter); err != nil {
+			return nil, err
+		}
+		if mergedAfter.Valid {
+			trigger.mergedAfter = fromMillis(mergedAfter.Int64)
+		}
+		triggers = append(triggers, trigger)
+	}
+	return triggers, rows.Err()
+}
+
+func (s *Store) advanceLabelTriggerCursor(ctx context.Context, trigger dueLabelTrigger) error {
+	next := s.now().Add(time.Duration(trigger.pollIntervalSeconds) * time.Second)
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE routine_triggers SET next_poll_at = ? WHERE routine_id = ? AND position = ?
+	`, next.UnixMilli(), trigger.routineID, trigger.position)
+	return err
+}
+
+func (s *Store) admitLabelTrigger(ctx context.Context, logger *slog.Logger, trigger dueLabelTrigger) error {
+	snapshot, err := s.labelTriggerRoutine(ctx, trigger.routineID)
 	if err != nil {
 		return err
 	}
 	if len(snapshot.Repositories) == 0 {
-		return fmt.Errorf("routine %q has no repositories", trigger.Routine)
-	}
-	mergedAfter, err := trigger.mergedAfter()
-	if err != nil {
-		return err
+		return fmt.Errorf("routine %q has no repositories", snapshot.Name)
 	}
 	for _, repository := range snapshot.Repositories {
-		items, err := listLabelledItems(ctx, trigger.kind(), repository.RemoteIdentity,
-			trigger.Label, trigger.state(), mergedAfter)
+		items, err := listLabelledItems(ctx, trigger.pollKind(), repository.RemoteIdentity,
+			trigger.label, trigger.state, trigger.mergedAfter)
 		if err != nil {
 			return err
 		}
@@ -252,17 +315,17 @@ func (s *Store) admitLabelTrigger(ctx context.Context, logger *slog.Logger, trig
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			admitted, err := s.admitLabelledItem(ctx, routineID, snapshot, trigger.Label, repository, item)
+			admitted, err := s.admitLabelledItem(ctx, trigger.routineID, snapshot, trigger.label, repository, item)
 			if err != nil {
 				logger.Error("label_admission_failed",
-					"routine", trigger.Routine, "kind", item.Kind, "label", trigger.Label,
+					"routine", snapshot.Name, "kind", item.Kind, "label", trigger.label,
 					"repository", repository.RemoteIdentity, "number", item.Number,
 					"error", err)
 				continue
 			}
 			if admitted {
 				logger.Info("label_work_admitted",
-					"routine", trigger.Routine, "kind", item.Kind, "label", trigger.Label,
+					"routine", snapshot.Name, "kind", item.Kind, "label", trigger.label,
 					"repository", repository.RemoteIdentity, "number", item.Number)
 			}
 		}
@@ -270,28 +333,28 @@ func (s *Store) admitLabelTrigger(ctx context.Context, logger *slog.Logger, trig
 	return nil
 }
 
-// labelTriggerRoutine resolves a Routine by its operator-facing name and
-// refuses states that must not start new Work.
-func (s *Store) labelTriggerRoutine(ctx context.Context, name string) (string, protocol.RoutineSnapshot, error) {
+// labelTriggerRoutine freezes the Routine a due trigger belongs to. The state
+// checks in dueLabelTriggers can go stale between selecting and admitting, so
+// they are repeated here.
+func (s *Store) labelTriggerRoutine(ctx context.Context, id string) (protocol.RoutineSnapshot, error) {
 	var snapshot protocol.RoutineSnapshot
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return "", snapshot, err
+		return snapshot, err
 	}
 	defer tx.Rollback()
-	var id string
-	var archived, migrationOnly, readOnly int
+	var enabled, archived, migrationOnly, readOnly int
 	err = tx.QueryRowContext(ctx, `
-		SELECT id, archived, migration_only, read_only FROM routines WHERE name_key = ?
-	`, normalizeTitleKey(name)).Scan(&id, &archived, &migrationOnly, &readOnly)
+		SELECT enabled, archived, migration_only, read_only FROM routines WHERE id = ?
+	`, id).Scan(&enabled, &archived, &migrationOnly, &readOnly)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", snapshot, fmt.Errorf("routine %q was not found", name)
+		return snapshot, fmt.Errorf("routine %q was not found", id)
 	}
 	if err != nil {
-		return "", snapshot, err
+		return snapshot, err
 	}
-	if archived == 1 || migrationOnly == 1 || readOnly == 1 {
-		return "", snapshot, fmt.Errorf("routine %q is archived or read-only", name)
+	if enabled == 0 || archived == 1 || migrationOnly == 1 || readOnly == 1 {
+		return snapshot, fmt.Errorf("routine %q is not active", id)
 	}
 	// Deliberately not loadCurrentRoutineSnapshot: that helper serves the
 	// scheduler, which only ever loads Routines that have a schedule, so it
@@ -304,7 +367,7 @@ func (s *Store) labelTriggerRoutine(ctx context.Context, name string) (string, p
 	`, id).Scan(&snapshot.ID, &snapshot.Name, &snapshot.Prompt, &snapshot.Runtime,
 		&snapshot.TimeoutSeconds, &snapshot.ConcurrencyLimit, &snapshot.Generation)
 	if err != nil {
-		return "", snapshot, err
+		return snapshot, err
 	}
 	rows, err := tx.QueryContext(ctx, `
 		SELECT repository.id, repository.remote_identity
@@ -313,23 +376,23 @@ func (s *Store) labelTriggerRoutine(ctx context.Context, name string) (string, p
 		WHERE selected.routine_id = ? ORDER BY selected.position
 	`, id)
 	if err != nil {
-		return "", snapshot, err
+		return snapshot, err
 	}
 	for rows.Next() {
 		var repository protocol.RoutineRepository
 		if err := rows.Scan(&repository.ID, &repository.RemoteIdentity); err != nil {
 			rows.Close()
-			return "", snapshot, err
+			return snapshot, err
 		}
 		snapshot.Repositories = append(snapshot.Repositories, repository)
 	}
 	if err := rows.Close(); err != nil {
-		return "", snapshot, err
+		return snapshot, err
 	}
 	if err := tx.Commit(); err != nil {
-		return "", snapshot, err
+		return snapshot, err
 	}
-	return id, snapshot, nil
+	return snapshot, nil
 }
 
 // admitLabelledItem reports whether new Work was created. A repeated call for

@@ -1,10 +1,40 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Archive, CalendarClock, Eye, GitBranch, Pencil, Play, Plus, X } from "lucide-react";
+import { Archive, CalendarClock, Eye, GitBranch, Pencil, Play, Plus, Tag, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "./api";
 import { timeAgo } from "./format";
-import type { ManagedRepository, Routine, Runtime, SaveRoutineInput } from "./types";
+import type { ManagedRepository, Routine, RoutineTrigger, Runtime, SaveRoutineInput, TriggerKind, TriggerState } from "./types";
 import { EmptyState, ErrorState, InlineError, LoadingState, StatusBadge, ViewHeader } from "./ui";
+
+const triggerKindLabel: Record<TriggerKind, string> = {
+  github_issue: "Issue",
+  github_pull_request: "Pull request",
+};
+
+/** Renders an instant for datetime-local, which expects local wall time. */
+function toLocalInput(value?: string): string {
+  if (!value) return "";
+  const instant = new Date(value);
+  if (Number.isNaN(instant.getTime())) return "";
+  const pad = (part: number) => String(part).padStart(2, "0");
+  return `${instant.getFullYear()}-${pad(instant.getMonth() + 1)}-${pad(instant.getDate())}T${pad(instant.getHours())}:${pad(instant.getMinutes())}`;
+}
+
+function fromLocalInput(value: string): string | undefined {
+  if (!value) return undefined;
+  const instant = new Date(value);
+  return Number.isNaN(instant.getTime()) ? undefined : instant.toISOString();
+}
+
+/** Describes what starts this Routine without opening its editor. */
+function automationSummary(routine: Routine): string {
+  const parts: string[] = [];
+  if (routine.schedule.enabled) parts.push(`${routine.schedule.cron} · ${routine.schedule.timezone}`);
+  for (const trigger of routine.triggers ?? []) {
+    parts.push(`${triggerKindLabel[trigger.kind]} ${trigger.state} · ${trigger.label}`);
+  }
+  return parts.length ? parts.join(" — ") : "Manual only";
+}
 
 export function RoutinesView({ initialID, createOpen, onWork }: { initialID?: string; createOpen?: boolean; onWork: (id: string) => void }) {
   const client = useQueryClient();
@@ -29,6 +59,13 @@ export function RoutinesView({ initialID, createOpen, onWork }: { initialID?: st
       void client.invalidateQueries({ queryKey: ["overview"] });
     },
   });
+  const setEnabled = useMutation({
+    mutationFn: (routine: Routine) => api.setRoutineEnabled(routine.id, !routine.enabled, routine.generation),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ["routines"] });
+      void client.invalidateQueries({ queryKey: ["overview"] });
+    },
+  });
   const resetArchive = archive.reset;
   const openRoutine = useCallback((id: string) => {
     resetArchive();
@@ -48,7 +85,7 @@ export function RoutinesView({ initialID, createOpen, onWork }: { initialID?: st
         <button className="button button-primary" onClick={() => { resetArchive(); setEditing("new"); }}><Plus size={15} /> New Routine</button>
       </div>
     </div>
-    <InlineError error={run.error} />
+    <InlineError error={run.error ?? setEnabled.error} />
     {!query.data?.length ? <EmptyState icon={<CalendarClock size={22} />} title="No Routines yet" description="Create one prompt, choose its repositories, then run it now or on a schedule." action={<button className="button button-primary" onClick={() => setEditing("new")}><Plus size={15} /> New Routine</button>} /> :
       <div className="routine-list panel">
         {query.data.map((routine) => <article className="routine-row" key={routine.id}>
@@ -58,8 +95,20 @@ export function RoutinesView({ initialID, createOpen, onWork }: { initialID?: st
             <small><GitBranch size={12} /> {routine.repository_count} repos · {routine.runtime} · up to {routine.concurrency_limit} at once</small>
           </button>
           <div className="routine-schedule">
-            <StatusBadge state={routine.schedule.enabled ? routine.schedule.health_status : "disabled"} />
-            <small>{routine.schedule.enabled ? `${routine.schedule.cron} · ${routine.schedule.timezone}` : "Manual only"}</small>
+            <label className="routine-power">
+              <input
+                type="checkbox"
+                role="switch"
+                aria-label={`Activate ${routine.name}`}
+                checked={routine.enabled}
+                disabled={routine.read_only || routine.archived || setEnabled.isPending}
+                onChange={() => setEnabled.mutate(routine)}
+              />
+              <span>{routine.enabled ? "Active" : "Paused"}</span>
+              {routine.schedule.enabled && routine.enabled && routine.schedule.health_status !== "healthy" &&
+                <StatusBadge state={routine.schedule.health_status} />}
+            </label>
+            <small title={automationSummary(routine)}>{automationSummary(routine)}</small>
           </div>
           <div className="routine-last"><span>{routine.last_work_state ? <StatusBadge state={routine.last_work_state} /> : "No Work yet"}</span><small>Edited {timeAgo(routine.updated_at)}</small></div>
           <div className="routine-actions">
@@ -86,21 +135,39 @@ function RoutineComposer({ routine, onClose, onSaved, onArchive, archiveError, a
   const [timeout, setTimeoutValue] = useState(routine?.timeout_seconds ?? 7200);
   const [concurrency, setConcurrency] = useState(routine?.concurrency_limit ?? 10);
   const [selected, setSelected] = useState<string[]>(routine?.repositories?.map((repository) => repository.id) ?? []);
+  const [enabled, setEnabled] = useState(routine ? routine.enabled : true);
   const [scheduled, setScheduled] = useState(routine?.schedule.enabled ?? false);
   const [cron, setCron] = useState(routine?.schedule.cron ?? "0 9 * * 1");
   const [timezone, setTimezone] = useState(routine?.schedule.timezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone);
+  const [triggers, setTriggers] = useState<RoutineTrigger[]>(routine?.triggers ?? []);
   const save = useMutation({
     mutationFn: () => {
       const input: SaveRoutineInput = {
-        name, prompt, runtime, timeout_seconds: timeout,
+        name, prompt, runtime, enabled: routine?.archived ? false : enabled, timeout_seconds: timeout,
         concurrency_limit: concurrency, repository_ids: selected,
         schedule: { enabled: scheduled, cron: scheduled ? cron : undefined, timezone: scheduled ? timezone : undefined },
+        triggers: triggers.map((trigger) => ({
+          ...trigger,
+          merged_after: trigger.state === "merged" ? trigger.merged_after : undefined,
+        })),
         expected_generation: routine?.generation,
       };
       return routine ? api.updateRoutine(routine.id, input) : api.createRoutine(input);
     },
     onSuccess: onSaved,
   });
+  const updateTrigger = (index: number, patch: Partial<RoutineTrigger>) =>
+    setTriggers((current) => current.map((trigger, position) => position === index ? { ...trigger, ...patch } : trigger));
+  // A merged trigger needs a bound, so adding the state supplies "from now".
+  const changeTriggerState = (index: number, state: TriggerState) =>
+    updateTrigger(index, {
+      state,
+      merged_after: state === "merged"
+        ? (triggers[index].merged_after ?? new Date().toISOString())
+        : undefined,
+    });
+  const triggersIncomplete = triggers.some((trigger) =>
+    !trigger.label.trim() || (trigger.state === "merged" && !trigger.merged_after));
   const discard = useMutation({
     mutationFn: () => api.discardRoutineOccurrence(routine!.id, routine!.schedule.pending_due_at!),
     onSuccess: onSaved,
@@ -120,13 +187,73 @@ function RoutineComposer({ routine, onClose, onSaved, onArchive, archiveError, a
         </div>
         <div className="field"><span>Repositories</span><div className="repository-picker">{(repositories.data ?? []).map((repository: ManagedRepository) => <button type="button" key={repository.id} disabled={readOnly} className={selected.includes(repository.id) ? "selected" : ""} onClick={() => toggleRepository(repository.id)}><span className="check-mark">{selected.includes(repository.id) ? "✓" : ""}</span><GitBranch size={14} />{repository.remote_identity}</button>)}</div></div>
         <div className="schedule-card">
+          <label className="switch-line">
+            <span><strong>Active</strong><small>A paused Routine runs no schedule and no trigger. Run now stays available.</small></span>
+            <input type="checkbox" role="switch" disabled={readOnly || routine?.archived} checked={routine?.archived ? false : enabled} onChange={(event) => setEnabled(event.target.checked)} />
+          </label>
+        </div>
+        <div className="schedule-card">
           <label className="switch-line"><span><strong>Schedule</strong><small>Run automatically using a five-field cron schedule.</small></span><input type="checkbox" disabled={readOnly} checked={scheduled} onChange={(event) => setScheduled(event.target.checked)} /></label>
           {scheduled && <div className="routine-settings schedule-fields"><label className="field"><span>Cron</span><input className="mono" disabled={readOnly} value={cron} onChange={(event) => setCron(event.target.value)} /></label><label className="field"><span>Timezone</span><input disabled={readOnly} value={timezone} onChange={(event) => setTimezone(event.target.value)} /></label></div>}
           {routine?.schedule.pending_due_at && <div className="pending-occurrence"><span><strong>{routine.schedule.health_status === "disabled" ? "Occurrence paused" : "Occurrence blocked"}</strong><small>{routine.schedule.health_message}</small></span>{!readOnly && (routine.schedule.health_status === "blocked" || routine.schedule.health_status === "disabled") && <button className="button button-danger-secondary" disabled={discard.isPending} onClick={() => discard.mutate()}>{discard.isPending ? "Discarding…" : "Discard occurrence"}</button>}</div>}
         </div>
+        <div className="schedule-card">
+          <div className="switch-line">
+            <span><strong>GitHub label triggers</strong><small>Start Work for every issue or pull request in this Routine’s repositories that carries a label.</small></span>
+            {!readOnly && <button type="button" className="button button-secondary" disabled={triggers.length >= 10} onClick={() => setTriggers((current) => [...current, {
+              kind: "github_issue", label: "", state: "open", poll_interval_seconds: 60,
+            }])}><Plus size={14} /> Add trigger</button>}
+          </div>
+          {!triggers.length ? <p className="quiet-empty">No trigger. This Routine starts only when you run it or when its schedule is due.</p> :
+            <div className="trigger-list">
+              {triggers.map((trigger, index) => <div className="trigger-row" key={index}>
+                <div className="field">
+                  <span>Event</span>
+                  <div className="choice-control trigger-kind-control">
+                    {(["github_issue", "github_pull_request"] as TriggerKind[]).map((kind) => <button
+                      type="button" key={kind} disabled={readOnly} aria-pressed={trigger.kind === kind}
+                      onClick={() => updateTrigger(index, {
+                        kind,
+                        // Only a pull request can be merged, so the state falls back.
+                        ...(kind === "github_issue" && trigger.state === "merged" ? { state: "open" as TriggerState, merged_after: undefined } : {}),
+                      })}
+                    >{triggerKindLabel[kind]}</button>)}
+                  </div>
+                </div>
+                <label className="field">
+                  <span>Label</span>
+                  <input className="mono" disabled={readOnly} value={trigger.label} placeholder="factory:dispatch"
+                    onChange={(event) => updateTrigger(index, { label: event.target.value })} />
+                </label>
+                <label className="field">
+                  <span>State</span>
+                  <select disabled={readOnly} value={trigger.state} onChange={(event) => changeTriggerState(index, event.target.value as TriggerState)}>
+                    <option value="open">Open</option>
+                    <option value="closed">Closed</option>
+                    {trigger.kind === "github_pull_request" && <option value="merged">Merged</option>}
+                  </select>
+                </label>
+                <label className="field">
+                  <span>Poll every (s)</span>
+                  <input type="number" min={10} max={86400} step={10} disabled={readOnly}
+                    value={trigger.poll_interval_seconds}
+                    onChange={(event) => updateTrigger(index, { poll_interval_seconds: Number(event.target.value) })} />
+                </label>
+                {!readOnly && <button type="button" className="icon-button trigger-remove" aria-label={`Remove trigger ${index + 1}`}
+                  onClick={() => setTriggers((current) => current.filter((_, position) => position !== index))}><Trash2 size={15} /></button>}
+                {trigger.state === "merged" && <label className="field trigger-bound">
+                  <span>Only merged after</span>
+                  <input type="datetime-local" disabled={readOnly} value={toLocalInput(trigger.merged_after)}
+                    onChange={(event) => updateTrigger(index, { merged_after: fromLocalInput(event.target.value) })} />
+                  <small>Without a bound the first poll would admit Work for every pull request ever merged with this label.</small>
+                </label>}
+              </div>)}
+            </div>}
+          {triggers.length > 0 && !selected.length && <p className="quiet-empty"><Tag size={12} /> Select at least one repository — a trigger polls the Routine’s repositories.</p>}
+        </div>
         <InlineError error={save.error ?? archiveError ?? discard.error ?? repositories.error} />
       </div>
-      <footer className="modal-footer">{routine && !readOnly && <button className="button button-danger-secondary" disabled={archivePending} onClick={() => onArchive(routine)}><Archive size={14} /> {archivePending ? (routine.archived ? "Restoring…" : "Archiving…") : (routine.archived ? "Restore" : "Archive")}</button>}<span /><button className="button button-secondary" onClick={onClose}>{readOnly ? "Close" : "Cancel"}</button>{!readOnly && <button className="button button-primary" disabled={save.isPending || !name.trim() || !prompt.trim() || (scheduled && selected.length === 0)} onClick={() => save.mutate()}>{save.isPending ? "Saving…" : "Save Routine"}</button>}</footer>
+      <footer className="modal-footer">{routine && !readOnly && <button className="button button-danger-secondary" disabled={archivePending} onClick={() => onArchive(routine)}><Archive size={14} /> {archivePending ? (routine.archived ? "Restoring…" : "Archiving…") : (routine.archived ? "Restore" : "Archive")}</button>}<span /><button className="button button-secondary" onClick={onClose}>{readOnly ? "Close" : "Cancel"}</button>{!readOnly && <button className="button button-primary" disabled={save.isPending || !name.trim() || !prompt.trim() || ((scheduled || triggers.length > 0) && selected.length === 0) || triggersIncomplete} onClick={() => save.mutate()}>{save.isPending ? "Saving…" : "Save Routine"}</button>}</footer>
     </section>
   </div>;
 }
