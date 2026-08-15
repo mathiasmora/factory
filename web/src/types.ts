@@ -18,6 +18,19 @@ export interface RoutineSchedule {
   health_message?: string;
 }
 
+export type TriggerKind = "github_issue" | "github_pull_request";
+export type TriggerState = "open" | "closed" | "merged";
+
+export interface RoutineTrigger {
+  kind: TriggerKind;
+  label: string;
+  state: TriggerState;
+  poll_interval_seconds: number;
+  /** Required for a merged pull-request trigger so history is not replayed. */
+  merged_after?: string;
+  next_poll_at?: string;
+}
+
 export interface Routine {
   id: string;
   name: string;
@@ -27,11 +40,13 @@ export interface Routine {
   timeout_seconds: number;
   concurrency_limit: number;
   generation: number;
+  enabled: boolean;
   archived: boolean;
   read_only: boolean;
   repositories: RoutineRepository[] | null;
   repository_count: number;
   schedule: RoutineSchedule;
+  triggers: RoutineTrigger[] | null;
   last_work_state?: WorkState;
   created_at: string;
   updated_at: string;
@@ -41,10 +56,12 @@ export interface SaveRoutineInput {
   name: string;
   prompt: string;
   runtime: Runtime;
+  enabled: boolean;
   timeout_seconds: number;
   concurrency_limit: number;
   repository_ids: string[];
   schedule: { enabled: boolean; cron?: string; timezone?: string };
+  triggers: RoutineTrigger[];
   expected_generation?: number;
 }
 

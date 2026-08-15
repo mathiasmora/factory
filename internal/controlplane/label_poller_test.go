@@ -3,6 +3,7 @@ package controlplane
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -48,12 +49,12 @@ label = "factory:dispatch"
 	if err != nil || !found {
 		t.Fatalf("found %v, err %v", found, err)
 	}
-	if config.interval() != labelPollMinimumInterval {
-		t.Fatalf("interval = %s, want %s", config.interval(), labelPollMinimumInterval)
+	if config.intervalSeconds() != protocol.MinTriggerPollInterval {
+		t.Fatalf("interval = %d, want %d", config.intervalSeconds(), protocol.MinTriggerPollInterval)
 	}
 	unset := labelPollerConfig{}
-	if unset.interval() != labelPollDefaultInterval {
-		t.Fatalf("default interval = %s, want %s", unset.interval(), labelPollDefaultInterval)
+	if unset.intervalSeconds() != protocol.DefaultTriggerPollSeconds {
+		t.Fatalf("default interval = %d, want %d", unset.intervalSeconds(), protocol.DefaultTriggerPollSeconds)
 	}
 }
 
@@ -210,18 +211,19 @@ func newLabelTestRoutine(t *testing.T, store *Store, name string) (string, proto
 	worker := registerTestWorker(t, store, workerA, 1, protocol.RepositoryRegistration{
 		Key: "factory", RemoteIdentity: "github.com/owainlewis/factory",
 	})
-	if _, err := store.CreateRoutine(context.Background(), protocol.SaveRoutineRequest{
+	created, err := store.CreateRoutine(context.Background(), protocol.SaveRoutineRequest{
 		Name: name, Prompt: "Implement the ticket.", Runtime: protocol.RuntimeCodex,
 		TimeoutSeconds: 3600, ConcurrencyLimit: 10,
 		RepositoryIDs: []string{worker.Repositories[0].ID},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	routineID, snapshot, err := store.labelTriggerRoutine(context.Background(), name)
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return routineID, snapshot
+	snapshot, err := store.labelTriggerRoutine(context.Background(), created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return created.ID, snapshot
 }
 
 // The poller relies on the UNIQUE request_key rather than its own bookkeeping,
@@ -321,7 +323,127 @@ func TestLabelTriggerRoutineRejectsArchivedRoutine(t *testing.T) {
 		}); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := store.labelTriggerRoutine(context.Background(), routine.Name); err == nil {
+	if _, err := store.labelTriggerRoutine(context.Background(), routineID); err == nil {
 		t.Fatal("expected archived Routine to be refused")
+	}
+}
+
+// An operator's labels.toml must survive the move to database triggers, and
+// must not be reapplied afterwards: re-importing would resurrect triggers that
+// were since deleted in the UI.
+func TestImportLabelPollerConfigRunsOnce(t *testing.T) {
+	store := newTestStore(t)
+	routineID, _ := newLabelTestRoutine(t, store, "Advance the chain")
+	home := t.TempDir()
+	t.Setenv("FACTORY_DATA_HOME", home)
+	if err := os.WriteFile(filepath.Join(home, "labels.toml"), []byte(`
+poll_interval_seconds = 120
+
+[[trigger]]
+routine      = "Advance the chain"
+kind         = "pull_request"
+label        = "factory:epic-chain"
+state        = "merged"
+merged_after = "2026-08-15T00:00:00Z"
+
+[[trigger]]
+routine = "No such Routine"
+label   = "factory:orphan"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store.importLabelPollerConfig(context.Background(), slog.New(slog.DiscardHandler))
+	routine, err := store.Routine(context.Background(), routineID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routine.Triggers) != 1 {
+		t.Fatalf("triggers = %#v", routine.Triggers)
+	}
+	trigger := routine.Triggers[0]
+	if trigger.Kind != protocol.TriggerGitHubPullRequest || trigger.State != "merged" ||
+		trigger.Label != "factory:epic-chain" || trigger.PollIntervalSeconds != 120 {
+		t.Fatalf("trigger = %#v", trigger)
+	}
+	if trigger.MergedAfter == nil || !trigger.MergedAfter.Equal(time.Date(2026, 8, 15, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("merged_after = %v", trigger.MergedAfter)
+	}
+	// A trigger the operator deleted after the import must stay deleted.
+	if _, err := store.db.ExecContext(context.Background(), `DELETE FROM routine_triggers`); err != nil {
+		t.Fatal(err)
+	}
+	store.importLabelPollerConfig(context.Background(), slog.New(slog.DiscardHandler))
+	if routine, err = store.Routine(context.Background(), routineID); err != nil {
+		t.Fatal(err)
+	}
+	if len(routine.Triggers) != 0 {
+		t.Fatalf("the import ran twice: %#v", routine.Triggers)
+	}
+}
+
+// A paused Routine must starve its triggers, otherwise deactivating it in the
+// UI would leave label admission running behind the operator's back.
+func TestLabelTriggerRoutineRejectsDisabledRoutine(t *testing.T) {
+	store := newTestStore(t)
+	routineID, _ := newLabelTestRoutine(t, store, "Paused routine")
+	routine, err := store.Routine(context.Background(), routineID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SetRoutineEnabled(context.Background(), routineID,
+		protocol.SetRoutineEnabledRequest{
+			Enabled: boolPointer(false), ExpectedGeneration: routine.Generation,
+		}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.labelTriggerRoutine(context.Background(), routineID); err == nil {
+		t.Fatal("expected paused Routine to be refused")
+	}
+}
+
+func TestDueLabelTriggersSkipsPausedRoutineAndRespectsInterval(t *testing.T) {
+	store := newTestStore(t)
+	routineID, _ := newLabelTestRoutine(t, store, "Trigger routine")
+	routine, err := store.Routine(context.Background(), routineID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved, err := store.UpdateRoutine(context.Background(), routineID, protocol.SaveRoutineRequest{
+		Name: routine.Name, Prompt: routine.Prompt, Runtime: routine.Runtime,
+		TimeoutSeconds: routine.TimeoutSeconds, ConcurrencyLimit: routine.ConcurrencyLimit,
+		RepositoryIDs:      []string{routine.Repositories[0].ID},
+		Triggers:           []protocol.RoutineTrigger{{Kind: protocol.TriggerGitHubIssue, Label: "factory:dispatch"}},
+		ExpectedGeneration: routine.Generation,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	due, err := store.dueLabelTriggers(context.Background())
+	if err != nil || len(due) != 1 {
+		t.Fatalf("due = %#v, err %v", due, err)
+	}
+	if due[0].pollIntervalSeconds != protocol.DefaultTriggerPollSeconds {
+		t.Fatalf("interval = %d", due[0].pollIntervalSeconds)
+	}
+	// Advancing the cursor takes the trigger out of the due set until its own
+	// interval elapses.
+	if err := store.advanceLabelTriggerCursor(context.Background(), due[0]); err != nil {
+		t.Fatal(err)
+	}
+	if due, err = store.dueLabelTriggers(context.Background()); err != nil || len(due) != 0 {
+		t.Fatalf("due after advancing = %#v, err %v", due, err)
+	}
+	if _, err := store.SetRoutineEnabled(context.Background(), routineID,
+		protocol.SetRoutineEnabledRequest{
+			Enabled: boolPointer(false), ExpectedGeneration: saved.Generation,
+		}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(context.Background(),
+		`UPDATE routine_triggers SET next_poll_at = NULL`); err != nil {
+		t.Fatal(err)
+	}
+	if due, err = store.dueLabelTriggers(context.Background()); err != nil || len(due) != 0 {
+		t.Fatalf("paused Routine still due: %#v, err %v", due, err)
 	}
 }

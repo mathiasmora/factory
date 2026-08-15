@@ -27,6 +27,29 @@ type RoutineRepository struct {
 	RemoteIdentity string `json:"remote_identity"`
 }
 
+const (
+	TriggerGitHubIssue       = "github_issue"
+	TriggerGitHubPullRequest = "github_pull_request"
+
+	MaxRoutineTriggers        = 10
+	MinTriggerPollInterval    = 10
+	MaxTriggerPollInterval    = 86400
+	DefaultTriggerPollSeconds = 60
+)
+
+// RoutineTrigger admits Work for a GitHub issue or pull request carrying Label.
+// State is open or closed for an issue, and open, closed, or merged for a pull
+// request. MergedAfter is required for a merged trigger so enabling one does
+// not replay the repository's merge history.
+type RoutineTrigger struct {
+	Kind                string     `json:"kind"`
+	Label               string     `json:"label"`
+	State               string     `json:"state"`
+	PollIntervalSeconds int        `json:"poll_interval_seconds"`
+	MergedAfter         *time.Time `json:"merged_after,omitempty"`
+	NextPollAt          *time.Time `json:"next_poll_at,omitempty"`
+}
+
 type Routine struct {
 	ID               string              `json:"id"`
 	Name             string              `json:"name"`
@@ -36,11 +59,13 @@ type Routine struct {
 	TimeoutSeconds   int                 `json:"timeout_seconds"`
 	ConcurrencyLimit int                 `json:"concurrency_limit"`
 	Generation       int                 `json:"generation"`
+	Enabled          bool                `json:"enabled"`
 	Archived         bool                `json:"archived"`
 	ReadOnly         bool                `json:"read_only"`
 	Repositories     []RoutineRepository `json:"repositories"`
 	RepositoryCount  int                 `json:"repository_count"`
 	Schedule         RoutineSchedule     `json:"schedule"`
+	Triggers         []RoutineTrigger    `json:"triggers"`
 	LastWorkState    string              `json:"last_work_state,omitempty"`
 	CreatedAt        time.Time           `json:"created_at"`
 	UpdatedAt        time.Time           `json:"updated_at"`
@@ -79,19 +104,28 @@ type RoutinePage struct {
 }
 
 type SaveRoutineRequest struct {
-	RequestKey         string          `json:"request_key,omitempty"`
-	Name               string          `json:"name"`
-	Prompt             string          `json:"prompt"`
-	Runtime            string          `json:"runtime"`
-	TimeoutSeconds     int             `json:"timeout_seconds"`
-	ConcurrencyLimit   int             `json:"concurrency_limit"`
-	RepositoryIDs      []string        `json:"repository_ids"`
-	Schedule           RoutineSchedule `json:"schedule"`
-	ExpectedGeneration int             `json:"expected_generation,omitempty"`
+	RequestKey string `json:"request_key,omitempty"`
+	Name       string `json:"name"`
+	Prompt     string `json:"prompt"`
+	Runtime    string `json:"runtime"`
+	// Enabled defaults to active when a client omits it, which keeps clients
+	// written against the pre-trigger request working.
+	Enabled            *bool            `json:"enabled,omitempty"`
+	TimeoutSeconds     int              `json:"timeout_seconds"`
+	ConcurrencyLimit   int              `json:"concurrency_limit"`
+	RepositoryIDs      []string         `json:"repository_ids"`
+	Schedule           RoutineSchedule  `json:"schedule"`
+	Triggers           []RoutineTrigger `json:"triggers,omitempty"`
+	ExpectedGeneration int              `json:"expected_generation,omitempty"`
 }
 
 type SetRoutineArchivedRequest struct {
 	Archived           *bool `json:"archived"`
+	ExpectedGeneration int   `json:"expected_generation"`
+}
+
+type SetRoutineEnabledRequest struct {
+	Enabled            *bool `json:"enabled"`
 	ExpectedGeneration int   `json:"expected_generation"`
 }
 

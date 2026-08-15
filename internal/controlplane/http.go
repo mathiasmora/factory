@@ -87,6 +87,7 @@ func NewHandler(store *Store, logger *slog.Logger) http.Handler {
 	mux.HandleFunc("GET /api/v1/routines/{routine_id}", api.getRoutine)
 	mux.HandleFunc("PUT /api/v1/routines/{routine_id}", api.updateRoutine)
 	mux.HandleFunc("PUT /api/v1/routines/{routine_id}/archived", api.setRoutineArchived)
+	mux.HandleFunc("PUT /api/v1/routines/{routine_id}/enabled", api.setRoutineEnabled)
 	mux.HandleFunc("POST /api/v1/routines/{routine_id}/run", api.runRoutine)
 	mux.HandleFunc("POST /api/v1/routines/{routine_id}/discard-occurrence", api.discardRoutineOccurrence)
 	mux.HandleFunc("GET /api/v1/work", api.listWork)

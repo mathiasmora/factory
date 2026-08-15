@@ -15,11 +15,13 @@ const routine: Routine = {
   timeout_seconds: 7200,
   concurrency_limit: 10,
   generation: 2,
+  enabled: true,
   archived: false,
   read_only: false,
   repositories: [],
   repository_count: 0,
   schedule: { enabled: false, health_status: "disabled" },
+  triggers: [],
   created_at: "2026-08-11T12:00:00Z",
   updated_at: "2026-08-11T12:00:00Z",
 };
@@ -68,6 +70,72 @@ describe("RoutinesView", () => {
 
     expect(await within(dialog).findByRole("alert")).toHaveTextContent("Routine changed; refresh and try again.");
     expect(screen.getByRole("dialog", { name: "Edit Routine" })).toBeVisible();
+  });
+
+  it("pauses a Routine from the list against its current generation", async () => {
+    vi.spyOn(api, "routines").mockResolvedValue([routine]);
+    const setRoutineEnabled = vi.spyOn(api, "setRoutineEnabled").mockResolvedValue({ ...routine, enabled: false });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    render(<QueryClientProvider client={client}><RoutinesView onWork={() => undefined} /></QueryClientProvider>);
+
+    const toggle = await screen.findByRole("switch", { name: "Activate Ship ready work" });
+    expect(toggle).toBeChecked();
+    await userEvent.click(toggle);
+
+    expect(setRoutineEnabled).toHaveBeenCalledWith(routine.id, false, routine.generation);
+  });
+
+  it("summarises the triggers that start a Routine", async () => {
+    const triggered: Routine = {
+      ...routine,
+      triggers: [{ kind: "github_pull_request", label: "factory:epic-chain", state: "merged", poll_interval_seconds: 120, merged_after: "2026-08-15T00:00:00Z" }],
+    };
+    vi.spyOn(api, "routines").mockResolvedValue([triggered]);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    render(<QueryClientProvider client={client}><RoutinesView onWork={() => undefined} /></QueryClientProvider>);
+
+    expect(await screen.findByText("Pull request merged · factory:epic-chain")).toBeVisible();
+  });
+
+  it("saves a merged pull-request trigger with its bound", async () => {
+    vi.spyOn(api, "routines").mockResolvedValue([routine]);
+    vi.spyOn(api, "routine").mockResolvedValue({ ...routine, repositories: [{ id: "repo-1", remote_identity: "github.com/acme/app" }], repository_count: 1 });
+    vi.spyOn(api, "repositories").mockResolvedValue([
+      { id: "repo-1", remote_identity: "github.com/acme/app", enabled: true, created_at: "", updated_at: "" },
+    ]);
+    const updateRoutine = vi.spyOn(api, "updateRoutine").mockResolvedValue(routine);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    render(<QueryClientProvider client={client}><RoutinesView initialID={routine.id} onWork={() => undefined} /></QueryClientProvider>);
+
+    const dialog = await screen.findByRole("dialog", { name: "Edit Routine" });
+    await userEvent.click(within(dialog).getByRole("button", { name: "Add trigger" }));
+    await userEvent.click(within(dialog).getByRole("button", { name: "Pull request" }));
+    await userEvent.type(within(dialog).getByLabelText("Label"), "factory:epic-chain");
+    await userEvent.selectOptions(within(dialog).getByLabelText("State"), "merged");
+    await userEvent.click(within(dialog).getByRole("button", { name: "Save Routine" }));
+
+    const saved = updateRoutine.mock.calls[0][1];
+    expect(saved.triggers).toHaveLength(1);
+    expect(saved.triggers[0]).toMatchObject({
+      kind: "github_pull_request", label: "factory:epic-chain", state: "merged", poll_interval_seconds: 60,
+    });
+    // Selecting merged supplies a bound so the first poll cannot replay history.
+    expect(saved.triggers[0].merged_after).toBeTruthy();
+  });
+
+  it("blocks saving a trigger without a label", async () => {
+    vi.spyOn(api, "routines").mockResolvedValue([routine]);
+    vi.spyOn(api, "routine").mockResolvedValue({ ...routine, repositories: [{ id: "repo-1", remote_identity: "github.com/acme/app" }], repository_count: 1 });
+    vi.spyOn(api, "repositories").mockResolvedValue([
+      { id: "repo-1", remote_identity: "github.com/acme/app", enabled: true, created_at: "", updated_at: "" },
+    ]);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    render(<QueryClientProvider client={client}><RoutinesView initialID={routine.id} onWork={() => undefined} /></QueryClientProvider>);
+
+    const dialog = await screen.findByRole("dialog", { name: "Edit Routine" });
+    await userEvent.click(within(dialog).getByRole("button", { name: "Add trigger" }));
+
+    expect(within(dialog).getByRole("button", { name: "Save Routine" })).toBeDisabled();
   });
 
   it("keeps the editor open and shows occurrence discard failures", async () => {

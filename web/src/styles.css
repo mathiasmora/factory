@@ -945,6 +945,18 @@ button { color: inherit; }
 .switch-line small { margin-top: 3px; color: var(--fg-3); font-size: 11px; }
 .switch-line input { width: 34px; height: 18px; accent-color: var(--accent); }
 .schedule-fields { grid-template-columns: 1fr 1fr; margin-top: 13px; padding-top: 13px; border-top: 1px solid var(--line); }
+.routine-power { display: flex; align-items: center; gap: 8px; font-size: 12px; cursor: pointer; }
+.routine-power input { width: 32px; height: 17px; flex: none; accent-color: var(--accent); }
+.routine-power input:disabled { cursor: not-allowed; opacity: .5; }
+.trigger-list { display: grid; gap: 14px; margin-top: 13px; padding-top: 13px; border-top: 1px solid var(--line); }
+.trigger-row { display: grid; grid-template-columns: minmax(150px, .9fr) minmax(140px, 1.2fr) minmax(90px, .6fr) minmax(90px, .6fr) auto; align-items: end; gap: 10px; }
+.trigger-row + .trigger-row { padding-top: 14px; border-top: 1px solid var(--line); }
+.trigger-row .field { margin-bottom: 0; }
+.trigger-kind-control { grid-template-columns: repeat(2, 1fr); }
+.trigger-bound { grid-column: 1 / -1; }
+.trigger-bound small { margin-top: 4px; color: var(--fg-3); font-size: 11px; }
+.trigger-remove { align-self: end; margin-bottom: 2px; }
+.schedule-card .quiet-empty { display: flex; align-items: center; gap: 6px; padding: 12px 0 0; }
 .pending-occurrence { display: flex; align-items: center; gap: 12px; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
 .pending-occurrence > span { flex: 1; }
 .pending-occurrence strong, .pending-occurrence small { display: block; }

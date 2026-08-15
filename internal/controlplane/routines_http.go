@@ -89,6 +89,23 @@ func (a *API) setRoutineArchived(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, routine)
 }
 
+func (a *API) setRoutineEnabled(w http.ResponseWriter, r *http.Request) {
+	if !prepareMutation(w, r, protocol.MaxBodyBytes) {
+		return
+	}
+	var input protocol.SetRoutineEnabledRequest
+	if !decodeJSON(w, r, &input) {
+		return
+	}
+	routine, err := a.store.SetRoutineEnabled(r.Context(), r.PathValue("routine_id"), input)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	a.logStateChange("routine", routine.ID, "updated")
+	writeJSON(w, http.StatusOK, routine)
+}
+
 func (a *API) runRoutine(w http.ResponseWriter, r *http.Request) {
 	if !prepareMutation(w, r, protocol.MaxBodyBytes) {
 		return
